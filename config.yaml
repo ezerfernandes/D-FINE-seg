@@ -1,14 +1,14 @@
 project_name: vis_drone # for wandb
-exp_name: test # experiment name
+exp_name: visdrone_det_l_mps # experiment name
 
 exp: ${exp_name}_${now_dir}
 
-model_name: s # model size (n, s, m, l, x)
+model_name: l # model size (n, s, m, l, x)
 task: detect
 
 train:
   ### Paths ###
-  root: /home/argo/Desktop/Projects/vis_drone # project root with dataset and outputs
+  root: . # project root with dataset and outputs
   pretrained_dataset: coco # coco, obj2coco
   pretrained_model_path: pretrained/dfine_${model_name}_${train.pretrained_dataset}.pt # dfine_m_obj2coco.pt
   coco_dataset: False # set True when annotations are in COCO JSON format (train.json, val.json, test.json)
@@ -23,8 +23,8 @@ train:
   infer_path: ${train.root}/output/infer
 
   ### Configs ###
-  use_wandb: True
-  device: cuda
+  use_wandb: False
+  device: mps
   label_to_name: # dataset's classes
     0: pedestrian
     1: people
@@ -54,15 +54,15 @@ train:
   to_visualize_eval: True # save images with gt and preds
   debug_img_processing: True # save images after preprocessing
 
-  amp_enabled: True # use automatic mixed precision
+  amp_enabled: False # use automatic mixed precision
   clip_max_norm: 0.1 # gradient clipping
 
-  batch_size: 8 # physical, should fit on the device. In DDP used per GPU
+  batch_size: 2 # physical, should fit on the device. In DDP used per GPU
   b_accum_steps: 1 # grad accumulation (n * bs)
   epochs: 75
   early_stopping: 0 # 0 - no early stopping
   ignore_background_epochs: 0 # background images are not used for N epochs in train set
-  num_workers: 12 # In DDP used per GPU
+  num_workers: 4 # In DDP used per GPU
   mask_batch_size: 1000 # number of images to process at once when computing mask metrics
 
   ### Validation ###
