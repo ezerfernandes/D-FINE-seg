@@ -1,0 +1,124 @@
+project_name: vis_drone
+exp_name: visdrone_det_l_mps
+exp: ${exp_name}_${now_dir}
+model_name: l
+task: detect
+train:
+  root: .
+  pretrained_dataset: coco
+  pretrained_model_path: pretrained/dfine_${model_name}_${train.pretrained_dataset}.pt
+  coco_dataset: false
+  data_path: ${train.root}/data/dataset
+  path_to_test_data: ${train.root}/data/test
+  path_to_save: ${train.root}/output/models/${exp}
+  debug_img_path: ${train.root}/output/debug_images
+  eval_preds_path: ${train.root}/output/eval_preds
+  bench_img_path: ${train.root}/output/bench_imgs
+  infer_path: ${train.root}/output/infer
+  use_wandb: false
+  device: mps
+  label_to_name:
+    0: pedestrian
+    1: people
+    2: bicycle
+    3: car
+    4: van
+    5: truck
+    6: tricycle
+    7: awning-tricycle
+    8: bus
+    9: motor
+  use_one_class: false
+  ddp:
+    enabled: false
+    n_gpus: 2
+  decision_metrics:
+  - f1
+  - mAP_50
+  - iou
+  img_size:
+  - 640
+  - 640
+  keep_ratio: false
+  to_visualize_eval: true
+  debug_img_processing: false
+  amp_enabled: false
+  clip_max_norm: 0.1
+  batch_size: 2
+  b_accum_steps: 1
+  epochs: 75
+  early_stopping: 0
+  ignore_background_epochs: 0
+  num_workers: 4
+  mask_batch_size: 1000
+  conf_thresh: 0.5
+  iou_thresh: 0.5
+  use_ema: true
+  ema_momentum: 0.9998
+  use_scheduler: true
+  base_lr: ${train.lrs.${model_name}.base_lr}
+  backbone_lr: ${train.lrs.${model_name}.backbone_lr}
+  cycler_pct_start: 0.1
+  weight_decay: 0.000125
+  betas:
+  - 0.9
+  - 0.999
+  label_smoothing: 0.0
+  mosaic_augs:
+    mosaic_prob: 0.8
+    no_mosaic_epochs: 5
+    mosaic_scale:
+    - 0.5
+    - 1.5
+    degrees: 0.0
+    translate: 0.2
+    shear: 2.0
+  augs:
+    rotation_degree: 10
+    rotation_p: 0.05
+    multiscale_prob: 0.0
+    rotate_90: 0.05
+    left_right_flip: 0.3
+    up_down_flip: 0.0
+    to_gray: 0.01
+    blur: 0.01
+    gamma: 0.02
+    brightness: 0.02
+    noise: 0.01
+    coarse_dropout: 0.0
+  seed: 42
+  cudnn_fixed: false
+  lrs:
+    'n':
+      backbone_lr: 0.0004
+      base_lr: 0.0008
+    s:
+      backbone_lr: 6.0e-05
+      base_lr: 0.00025
+    m:
+      backbone_lr: 2.0e-05
+      base_lr: 0.00015
+    l:
+      backbone_lr: 1.0e-05
+      base_lr: 0.00016
+    x:
+      backbone_lr: 2.0e-06
+      base_lr: 0.0002
+split:
+  ignore_negatives: false
+  shuffle: true
+  train_split: 0.85
+  val_split: 0.15
+export:
+  half: true
+  max_batch_size: 1
+  dynamic_input: false
+  ov_int8_max_drop: 0.02
+  trt_int8_workspace_gb: 4
+  trt_int8_validate: true
+infer:
+  to_crop: true
+  paddings:
+    w: 0.05
+    h: 0.05
+now_dir: ${now:%Y-%m-%d}

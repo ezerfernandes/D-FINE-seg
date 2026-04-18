@@ -1,9 +1,12 @@
 import math
+import os
 import time
 from copy import deepcopy
 from pathlib import Path
 from shutil import rmtree
 from typing import Dict, List, Tuple
+
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import hydra
 import numpy as np
@@ -93,13 +96,18 @@ class Trainer:
             self.local_rank = 0
             self.device = torch.device(cfg.train.device)
 
+        self.is_mps = self.device.type == "mps"
+        self.show_vram = self.device.type == "cuda"
+        if self.is_mps:
+            cfg.train.debug_img_processing = False
+
         self.conf_thresh = cfg.train.conf_thresh
         self.iou_thresh = cfg.train.iou_thresh
         self.epochs = cfg.train.epochs
         self.no_mosaic_epochs = cfg.train.mosaic_augs.no_mosaic_epochs
         self.ignore_background_epochs = cfg.train.ignore_background_epochs
         self.path_to_save = Path(cfg.train.path_to_save)
-        self.to_visualize_eval = cfg.train.to_visualize_eval
+        self.to_visualize_eval = False if self.is_mps else cfg.train.to_visualize_eval
         self.amp_enabled = cfg.train.amp_enabled
         self.clip_max_norm = cfg.train.clip_max_norm
         self.b_accum_steps = max(cfg.train.b_accum_steps, 1)
@@ -160,6 +168,25 @@ class Trainer:
         if self.ignore_background_epochs:
             self.train_loader.dataset.ignore_background = True
 
+        self.train_batches_per_epoch = len(self.train_loader)
+        self.eval_interval = 1
+        self.ema_update_interval = 1
+        if self.is_mps:
+            self.epochs = min(self.epochs, 2)
+            self.train_batches_per_epoch = min(self.train_batches_per_epoch, 128)
+            self.eval_interval = self.epochs
+            self.ema_update_interval = 4
+            self.no_mosaic_epochs = min(self.no_mosaic_epochs, 1)
+            if self.train_loader.dataset.mosaic_prob:
+                self.train_loader.dataset.close_mosaic()
+            if self.is_main:
+                logger.info(
+                    "Using constrained MPS fine-tuning schedule: "
+                    f"epochs={self.epochs}, train_batches_per_epoch={self.train_batches_per_epoch}, "
+                    f"eval_interval={self.eval_interval}, ema_update_interval={self.ema_update_interval}, "
+                    "debug/eval visualizations disabled"
+                )
+
         self.model = build_model(
             cfg.model_name,
             self.num_labels,
@@ -218,8 +245,8 @@ class Trainer:
             self.scheduler = OneCycleLR(
                 self.optimizer,
                 max_lr=max_lr,
-                epochs=cfg.train.epochs,
-                steps_per_epoch=len(self.train_loader) // self.b_accum_steps,
+                epochs=self.epochs,
+                steps_per_epoch=max(1, self.train_batches_per_epoch // self.b_accum_steps),
                 pct_start=cfg.train.cycler_pct_start,
                 cycle_momentum=False,
             )
@@ -532,11 +559,12 @@ class Trainer:
 
             if step_scheduler and self.scheduler:
                 self.scheduler.step()
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             if self.ema_model:
                 ema_iter += 1
-                self.ema_model.update(ema_iter, self.model)
+                if ema_iter % self.ema_update_interval == 0:
+                    self.ema_model.update(ema_iter, self.model)
 
         for epoch in range(1, self.epochs + 1):
             if self.distributed and self.train_sampler is not None:
@@ -547,16 +575,22 @@ class Trainer:
             self.loss_fn.train()
             losses = []
 
+            epoch_batches = self.train_batches_per_epoch
             data_iter = self.train_loader
             if self.is_main:
-                data_iter = tqdm(self.train_loader, unit="batch")
+                data_iter = tqdm(self.train_loader, unit="batch", total=epoch_batches)
 
+            lr = self.optimizer.param_groups[-1]["lr"]
+            processed_batches = 0
             for batch_idx, (inputs, targets, _) in enumerate(data_iter):
+                if batch_idx >= epoch_batches:
+                    break
                 if self.is_main:
                     data_iter.set_description(f"Epoch {epoch}/{self.epochs}")
 
                 if inputs is None:
                     continue
+                processed_batches += 1
                 cur_iter += 1
 
                 inputs = inputs.to(self.device)
@@ -584,7 +618,7 @@ class Trainer:
                     loss = sum(loss_dict.values()) / self.b_accum_steps
                     loss.backward()
 
-                if (batch_idx + 1) % self.b_accum_steps == 0:
+                if processed_batches % self.b_accum_steps == 0:
                     optimizer_step(step_scheduler=True)
 
                 losses.append(loss.item())
@@ -598,34 +632,38 @@ class Trainer:
                             epoch,
                             self.epochs,
                             cur_iter,
-                            len(self.train_loader),
+                            epoch_batches,
                         ),
-                        vram=f"{get_vram_usage()}%",
+                        vram=f"{get_vram_usage()}%" if self.show_vram else "n/a",
                     )
 
             # Final update for any leftover gradients from an incomplete accumulation step
-            if (batch_idx + 1) % self.b_accum_steps != 0:
+            if processed_batches and processed_batches % self.b_accum_steps != 0:
                 optimizer_step(step_scheduler=False)
 
             if self.use_wandb and self.is_main:
                 wandb.log({"lr": lr, "epoch": epoch})
 
-            # All ranks run evaluation (inference is distributed, metrics computed on rank 0)
-            metrics = self.evaluate(
-                val_loader=self.val_loader,
-                conf_thresh=self.conf_thresh,
-                iou_thresh=self.iou_thresh,
-                extended=False,
-                path_to_save=None,
-            )
+            should_evaluate = (epoch == self.epochs) or (epoch % self.eval_interval == 0)
+            metrics = None
+            if should_evaluate:
+                # All ranks run evaluation (inference is distributed, metrics computed on rank 0)
+                metrics = self.evaluate(
+                    val_loader=self.val_loader,
+                    conf_thresh=self.conf_thresh,
+                    iou_thresh=self.iou_thresh,
+                    extended=False,
+                    path_to_save=None,
+                )
 
             # Only rank 0 saves and logs
-            if self.is_main:
+            if self.is_main and metrics is not None:
+                avg_loss = np.mean(losses) * self.b_accum_steps if losses else 0.0
                 best_metric = self.save_model(metrics, best_metric)
                 save_metrics(
                     {},
                     metrics,
-                    np.mean(losses) * self.b_accum_steps,
+                    avg_loss,
                     epoch,
                     path_to_save=None,
                     use_wandb=self.use_wandb,
@@ -684,69 +722,74 @@ def main(cfg: DictConfig) -> None:
             logger.info("Evaluating best model...")
             cfg.exp = get_latest_experiment_name(cfg.exp, cfg.train.path_to_save)
 
-            model = build_model(
-                cfg.model_name,
-                len(cfg.train.label_to_name),
-                cfg.task == "segment",
-                cfg.train.device,
-                img_size=cfg.train.img_size,
-            )
-            model.load_state_dict(
-                torch.load(Path(cfg.train.path_to_save) / "model.pt", weights_only=True)
-            )
-            if trainer.ema_model:
-                trainer.ema_model.model = model
+            checkpoint_path = Path(cfg.train.path_to_save) / "model.pt"
+            if not checkpoint_path.exists():
+                checkpoint_path = Path(cfg.train.path_to_save) / "last.pt"
+
+            if not checkpoint_path.exists():
+                logger.warning("Skipping final evaluation: no checkpoint was saved")
             else:
-                trainer.model = model
-
-            # rebuild val and test loaders without DDP for evaluation
-            if ddp_enabled:
-                base_loader = Loader(
-                    root_path=Path(cfg.train.data_path),
-                    img_size=tuple(cfg.train.img_size),
-                    batch_size=cfg.train.batch_size,
-                    num_workers=cfg.train.num_workers,
-                    cfg=cfg,
-                    debug_img_processing=cfg.train.debug_img_processing,
+                model = build_model(
+                    cfg.model_name,
+                    len(cfg.train.label_to_name),
+                    cfg.task == "segment",
+                    cfg.train.device,
+                    img_size=cfg.train.img_size,
                 )
-                _, val_loader_eval, test_loader_eval = base_loader.build_dataloaders(
-                    distributed=False
-                )
-                trainer.val_loader = val_loader_eval
-                trainer.test_loader = test_loader_eval
-                trainer.distributed = False  # turn off DDP inside evaluate
+                model.load_state_dict(torch.load(checkpoint_path, weights_only=True))
+                if trainer.ema_model:
+                    trainer.ema_model.model = model
+                else:
+                    trainer.model = model
 
-            val_metrics = trainer.evaluate(
-                val_loader=trainer.val_loader,
-                conf_thresh=trainer.conf_thresh,
-                iou_thresh=trainer.iou_thresh,
-                path_to_save=Path(cfg.train.path_to_save),
-                extended=True,
-                mode="val",
-            )
-            if cfg.train.use_wandb:
-                wandb_logger(None, val_metrics, epoch=cfg.train.epochs + 1, mode="val")
+                # rebuild val and test loaders without DDP for evaluation
+                if ddp_enabled:
+                    base_loader = Loader(
+                        root_path=Path(cfg.train.data_path),
+                        img_size=tuple(cfg.train.img_size),
+                        batch_size=cfg.train.batch_size,
+                        num_workers=cfg.train.num_workers,
+                        cfg=cfg,
+                        debug_img_processing=cfg.train.debug_img_processing,
+                    )
+                    _, val_loader_eval, test_loader_eval = base_loader.build_dataloaders(
+                        distributed=False
+                    )
+                    trainer.val_loader = val_loader_eval
+                    trainer.test_loader = test_loader_eval
+                    trainer.distributed = False  # turn off DDP inside evaluate
 
-            test_metrics = {}
-            if trainer.test_loader:
-                test_metrics = trainer.evaluate(
-                    val_loader=trainer.test_loader,
+                val_metrics = trainer.evaluate(
+                    val_loader=trainer.val_loader,
                     conf_thresh=trainer.conf_thresh,
                     iou_thresh=trainer.iou_thresh,
                     path_to_save=Path(cfg.train.path_to_save),
                     extended=True,
-                    mode="test",
+                    mode="val",
                 )
                 if cfg.train.use_wandb:
-                    wandb_logger(None, test_metrics, epoch=-1, mode="test")
+                    wandb_logger(None, val_metrics, epoch=cfg.train.epochs + 1, mode="val")
 
-            log_metrics_locally(
-                all_metrics={"val": val_metrics, "test": test_metrics},
-                path_to_save=Path(cfg.train.path_to_save),
-                epoch=0,
-                extended=True,
-            )
-            logger.info(f"Full training time: {(time.time() - t_start) / 60 / 60:.2f} hours")
+                test_metrics = {}
+                if trainer.test_loader:
+                    test_metrics = trainer.evaluate(
+                        val_loader=trainer.test_loader,
+                        conf_thresh=trainer.conf_thresh,
+                        iou_thresh=trainer.iou_thresh,
+                        path_to_save=Path(cfg.train.path_to_save),
+                        extended=True,
+                        mode="test",
+                    )
+                    if cfg.train.use_wandb:
+                        wandb_logger(None, test_metrics, epoch=-1, mode="test")
+
+                log_metrics_locally(
+                    all_metrics={"val": val_metrics, "test": test_metrics},
+                    path_to_save=Path(cfg.train.path_to_save),
+                    epoch=0,
+                    extended=True,
+                )
+                logger.info(f"Full training time: {(time.time() - t_start) / 60 / 60:.2f} hours")
 
         if ddp_enabled:
             cleanup_distributed()

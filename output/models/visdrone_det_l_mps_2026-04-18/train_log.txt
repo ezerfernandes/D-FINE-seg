@@ -1,0 +1,11 @@
+Experiment: visdrone_det_l_mps_2026-04-18, Task: detect, Annotations: YOLO
+Images in train: 6471, val: 548, test: 1610
+Objects count: car: 187004, pedestrian: 109187, motor: 40378, people: 38560, van: 32702, truck: 16284, bicycle: 13069, bus: 9117, tricycle: 6387, awning-tricycle: 4377
+Background images: 0
+Closing mosaic
+Using constrained MPS fine-tuning schedule: epochs=2, train_batches_per_epoch=128, eval_interval=2, ema_update_interval=4, debug/eval visualizations disabled
+Pretrained weigts from pretrained/dfine_l_coco.pt, {'missed': ['decoder.denoising_class_embed.weight'], 'unmatched': ['decoder.enc_score_head.weight', 'decoder.enc_score_head.bias', 'decoder.dec_score_head.0.weight', 'decoder.dec_score_head.0.bias', 'decoder.dec_score_head.1.weight', 'decoder.dec_score_head.1.bias', 'decoder.dec_score_head.2.weight', 'decoder.dec_score_head.2.bias', 'decoder.dec_score_head.3.weight', 'decoder.dec_score_head.3.bias', 'decoder.dec_score_head.4.weight', 'decoder.dec_score_head.4.bias', 'decoder.dec_score_head.5.weight', 'decoder.dec_score_head.5.bias']}
+EMA model will be evaluated and saved
+[Errno 32] Broken pipe
+Evaluating best model...
+Skipping final evaluation: no checkpoint was saved
